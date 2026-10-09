@@ -1,0 +1,40 @@
+correct_remembered_power:
+  name: Correct remembered AC power
+  description: >-
+    For a climate profile with a power policy, send one timer-cancellation
+    frame without toggling physical power, then flip only remembered power.
+    May make the AC beep. Does not send a subsequent ON or OFF request.
+    Unknown remembered power cannot be flipped; request ON or OFF first.
+  target:
+    entity:
+      integration: hair
+      domain: climate
+
+initialize_remembered_climate:
+  name: Initialize remembered AC state
+  description: >-
+    Copy saved controller memory to a freshly adopted power-policy climate
+    entity once, without IR. Refused after restoration or any send attempt.
+    These values are optimistic memory, not measured physical state.
+  target:
+    entity:
+      integration: hair
+      domain: climate
+  fields:
+    remembered_power:
+      required: true
+      selector:
+        boolean:
+    last_hvac_mode:
+      required: true
+      selector:
+        text:
+    fan_mode:
+      required: true
+      selector:
+        text:
+    temperature:
+      required: true
+      selector:
+        number:
+          mode: box

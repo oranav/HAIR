@@ -50,17 +50,20 @@ _last_ack: float = 0.0
 # that does not know (which is every caller on the old path), and the
 # hold then falls back to EMITTER_STAGGER_GAP_S alone.
 _last_air: float = 0.0
+_last_min_interval: float = 0.0
 # Bumped on every stamp. The hold is computed outside the lock, so this
 # is how a waiter tells "nothing moved while I waited" (my hold is still
 # good) from "somebody else keyed up" (recompute before sending).
 _ack_seq: int = 0
 
 
-def _hold_for(emitter_id: str) -> float:
+def _hold_for(emitter_id: str, minimum_interval: float = 0.0) -> float:
     """Seconds still owed before ``emitter_id`` may key up, or 0."""
-    if _last_emitter is None or _last_emitter == emitter_id:
+    if _last_emitter is None:
         return 0.0
-    quiet = max(EMITTER_STAGGER_GAP_S, _last_air)
+    quiet = max(_last_min_interval, minimum_interval)
+    if _last_emitter != emitter_id:
+        quiet = max(quiet, EMITTER_STAGGER_GAP_S, _last_air)
     return max(0.0, quiet - (time.monotonic() - _last_ack))
 
 
@@ -70,6 +73,7 @@ async def gated_send(
     ir_cmd: Any,
     sender: Callable[[Any, str, Any], Awaitable[None]],
     air_s: float = 0.0,
+    minimum_interval: float = 0.0,
 ) -> None:
     """Send ``ir_cmd`` via ``sender``, staggering emitter changes.
 
@@ -83,11 +87,11 @@ async def gated_send(
     the ack (send spacing, GH #151). Zero, the default, gives exactly
     today's EMITTER_STAGGER_GAP_S behaviour.
     """
-    global _last_emitter, _last_ack, _last_air, _ack_seq
+    global _last_emitter, _last_ack, _last_air, _ack_seq, _last_min_interval
     # Wait outside the lock: a hold that can now run to a second and a
     # half must not block a same-emitter send that owes nothing.
     seen = _ack_seq
-    wait = _hold_for(emitter_id)
+    wait = _hold_for(emitter_id, minimum_interval)
     if wait > 0:
         await asyncio.sleep(wait)
     async with _lock:
@@ -96,7 +100,7 @@ async def gated_send(
         # slept is still the right one, and sleeping it again would
         # double every stagger on the quiet path.
         if _ack_seq != seen:
-            wait = _hold_for(emitter_id)
+            wait = _hold_for(emitter_id, minimum_interval)
             if wait > 0:
                 await asyncio.sleep(wait)
         try:
@@ -107,13 +111,15 @@ async def gated_send(
             _last_emitter = emitter_id
             _last_ack = time.monotonic()
             _last_air = max(0.0, float(air_s or 0.0))
+            _last_min_interval = minimum_interval
             _ack_seq += 1
 
 
 def reset_for_test() -> None:
     """Reset module state between tests."""
-    global _last_emitter, _last_ack, _last_air, _ack_seq
+    global _last_emitter, _last_ack, _last_air, _ack_seq, _last_min_interval
     _last_emitter = None
     _last_ack = 0.0
     _last_air = 0.0
+    _last_min_interval = 0.0
     _ack_seq = 0

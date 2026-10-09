@@ -14,11 +14,14 @@ Two operating modes since Cold Cuts (v0.8.8), selected by
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import logging
+import math
 from dataclasses import asdict, dataclass
 from typing import TYPE_CHECKING, Any
 
+import voluptuous as vol
 from homeassistant.components.climate import (
     ATTR_FAN_MODE,
     ATTR_PRESET_MODE,
@@ -42,6 +45,7 @@ from homeassistant.helpers.event import async_track_state_change_event
 from homeassistant.helpers.restore_state import ExtraStoredData, RestoreEntity
 from homeassistant.util.unit_conversion import TemperatureConverter
 
+from .climate_power import power_variant
 from .const import DOMAIN, CommandSource, DeviceType
 from .matrix_store import SIGNAL_MATRIX_CHANGED
 from .models import IRDevice
@@ -89,6 +93,23 @@ async def async_setup_entry(
     data = hass.data[DOMAIN][entry.entry_id]
     device_manager = data["device_manager"]
     factory = data["entity_factory"]
+
+    # Native entity action: the profile supplies the cancel recipe.
+    from homeassistant.helpers.entity_platform import async_get_current_platform
+
+    async_get_current_platform().async_register_entity_service(
+        "correct_remembered_power", {}, "async_correct_remembered_power",
+    )
+    async_get_current_platform().async_register_entity_service(
+        "initialize_remembered_climate",
+        {
+            vol.Required("remembered_power"): bool,
+            vol.Required("last_hvac_mode"): str,
+            vol.Required("fan_mode"): str,
+            vol.Required("temperature"): vol.Coerce(float),
+        },
+        "async_initialize_remembered_climate",
+    )
 
     entities: dict[str, HAIRClimateEntity] = {}
 
@@ -152,9 +173,13 @@ class _ClimateExtraStoredData(ExtraStoredData):
     """
 
     native_target_temperature: float | None
+    power_state: dict[str, Any] | None = None
 
     def as_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        data = asdict(self)
+        if self.power_state is None:
+            data.pop("power_state")
+        return data
 
     @classmethod
     def from_dict(cls, restored: dict[str, Any]) -> _ClimateExtraStoredData | None:
@@ -162,7 +187,8 @@ class _ClimateExtraStoredData(ExtraStoredData):
             raw = restored["native_target_temperature"]
         except KeyError:
             return None
-        return cls(native_target_temperature=float(raw) if raw is not None else None)
+        return cls(native_target_temperature=float(raw) if raw is not None else None,
+                   power_state=restored.get("power_state"))
 
 
 class HAIRClimateEntity(RestoreEntity, ClimateEntity):
@@ -179,6 +205,9 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
         self._attr_unique_id = f"hair_{device.id}_climate"
         self._attr_name = None
         self._hvac_mode = HVACMode.OFF
+        self._remembered_power: bool | None = None
+        self._power_request_lock = asyncio.Lock()
+        self._power_has_history = False
         self._target_temperature: float | None = None
         self._fan_mode: str | None = None
         # Matrix mode state (Cold Cuts). The matrix itself loads in
@@ -249,6 +278,10 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
     def _matrix_mode(self) -> bool:
         return self._device.climate_matrix
 
+    @property
+    def _power_policy(self):
+        return self._matrix.power_policy if self._matrix is not None else None
+
     async def async_added_to_hass(self) -> None:
         # Real HA calls the base hook (a no-op) here; the matrix load
         # is this entity's only other lifecycle need.
@@ -312,6 +345,9 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
         partially -- falls back to the blank state __init__ already
         set, not an error.
         """
+        if self._power_policy is not None:
+            await self._async_restore_power_state()
+            return
         last_state = await self.async_get_last_state()
         if last_state is None:
             return
@@ -431,7 +467,14 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
 
     @property
     def extra_restore_state_data(self) -> _ClimateExtraStoredData:
-        return _ClimateExtraStoredData(self._target_temperature)
+        power_state = None
+        if self._power_policy is not None:
+            power_state = {
+                "remembered_power": self._remembered_power,
+                "last_active_mode": str(self._last_active_hvac_mode),
+                "fan": self._fan_mode,
+            }
+        return _ClimateExtraStoredData(self._target_temperature, power_state)
 
     def _capture_active_mode(self) -> None:
         """Remember the mode about to be left, before flipping to OFF.
@@ -468,6 +511,9 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
     @callback
     def _handle_device_sent(self, sent: DeviceSent) -> None:
         """Follow a landed send from anywhere in HAIR."""
+        if self._power_policy is not None:
+            # These profiles are driven only through serialized climate requests.
+            return
         if sent.device_id != self._device.id:
             return
         if sent.origin == ORIGIN_ENTITY:
@@ -776,6 +822,9 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
         last mode" means the last one HAIR actually SENT rather than the
         last one a service call happened to set.
         """
+        if self._power_policy is not None:
+            # No physical feedback source is configured for this POC.
+            return
         if device_id != self._device.id:
             return
         if verdict == "off":
@@ -894,6 +943,12 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
 
     async def _async_load_matrix(self) -> None:
         self._matrix = await self._manager.async_get_matrix(self._device.id)
+        if self._power_policy is not None:
+            policy = self._power_policy
+            if self._last_active_hvac_mode is None:
+                self._last_active_hvac_mode = HVACMode(ha_mode_for(policy.default_mode))
+            if self._fan_mode is None:
+                self._fan_mode = policy.default_fan
         if self._matrix is not None and self._target_temperature is None:
             # Seed the dial for the same reason presets seed (v0.6.1
             # bench find: no draggable target while None). Midpoint of
@@ -915,8 +970,9 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
             self.hass.async_create_task(self._async_refresh_matrix())
 
     async def _async_refresh_matrix(self) -> None:
-        await self._async_load_matrix()
-        self.async_write_ha_state()
+        async with self._power_request_lock:
+            await self._async_load_matrix()
+            self.async_write_ha_state()
 
     @property
     def temperature_unit(self) -> str:
@@ -1051,11 +1107,17 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
         return modes
 
     @property
-    def hvac_mode(self) -> HVACMode:
+    def hvac_mode(self) -> HVACMode | None:
+        if self._power_policy is not None and self._remembered_power is None:
+            return None
         return self._hvac_mode
 
     @property
     def target_temperature(self) -> float | None:
+        if self._power_policy is not None:
+            mode = self._file_mode_for(self._last_active_hvac_mode)
+            if mode not in self._power_policy.temperature_modes:
+                return None
         return self._target_temperature
 
     @property
@@ -1110,11 +1172,17 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
                 return None
             # Verbatim file vocabulary, never normalized: these strings
             # are the resolve_cell lookup keys (addendum section 3).
-            return list(self._matrix.fan_modes) or None
+            fans = list(self._matrix.fan_modes)
+            if self._power_policy is not None and self._power_policy.fan_power_control:
+                fans.append("off")
+            return fans or None
         return list(self._device.entity_config.fan_modes or []) or None
 
     @property
     def fan_mode(self) -> str | None:
+        if (self._power_policy is not None and self._power_policy.fan_power_control
+                and self._remembered_power is False):
+            return "off"
         return self._fan_mode
 
     @property
@@ -1144,6 +1212,9 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
         None (not an empty list) when nothing is starred, so the
         picker is absent rather than empty.
         """
+        if self._power_policy is not None:
+            # Saved raw commands bypass transition selection; use climate services.
+            return None
         starred = {
             name.casefold() for name in self._device.entity_config.starred
         }
@@ -1166,9 +1237,180 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
             return None
         # The device page's current-cell readout (owner ruling Q2):
         # which complete state the unit last received from HAIR.
-        return {"matrix_cell": self._matrix_cell}
+        attrs = {"matrix_cell": self._matrix_cell}
+        if self._power_policy is not None:
+            attrs.update({
+                "remembered_power": self._remembered_power,
+                "last_hvac_mode": str(self._last_active_hvac_mode),
+                "saved_fan_mode": self._fan_mode,
+                "saved_temperature": self._target_temperature,
+                "temperature_control": "adjustable" if self.target_temperature is not None
+                else "not_supported_in_this_mode",
+                "power_state_source": "remembered/optimistic; IR reception is unconfirmed",
+            })
+        return attrs
 
     # -- matrix mode actions (Cold Cuts) --------------------------------
+
+    async def _async_restore_power_state(self) -> None:
+        """Restore independent saved settings and optimistic power, without IR."""
+        last = await self.async_get_last_state()
+        if last is None:
+            return
+        self._power_has_history = True
+        extra = await self.async_get_last_extra_data()
+        stored = _ClimateExtraStoredData.from_dict(extra.as_dict()) if extra else None
+        power_state = (
+            stored.power_state if stored and isinstance(stored.power_state, dict) else {}
+        )
+        attrs = last.attributes
+        mode = power_state.get("last_active_mode", attrs.get("last_hvac_mode"))
+        if mode is None and last.state not in (STATE_UNKNOWN, STATE_UNAVAILABLE, "off"):
+            mode = last.state
+        try:
+            candidate = HVACMode(mode)
+        except (ValueError, TypeError):
+            candidate = self._last_active_hvac_mode
+        if candidate in self.hvac_modes and candidate != HVACMode.OFF:
+            self._last_active_hvac_mode = candidate
+        fan = power_state.get("fan", attrs.get("saved_fan_mode", attrs.get(ATTR_FAN_MODE)))
+        if fan in self._matrix.fan_modes:
+            self._fan_mode = fan
+        temp = await self._restore_native_temperature(last)
+        if temp is not None and math.isfinite(temp):
+            self._target_temperature = self._snap_power_temperature(temp)
+        if "remembered_power" in power_state:
+            remembered = power_state["remembered_power"]
+            self._remembered_power = remembered if isinstance(remembered, bool) else None
+        elif last.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            self._remembered_power = None
+        elif last.state == "off":
+            self._remembered_power = False
+        elif last.state in [str(m) for m in self.hvac_modes]:
+            self._remembered_power = True
+        self._hvac_mode = self._last_active_hvac_mode if self._remembered_power else HVACMode.OFF
+
+    def _snap_power_temperature(self, target: float) -> float:
+        m = self._matrix
+        return min(m.max_temp, max(m.min_temp,
+                   m.min_temp + round((target - m.min_temp) / m.precision) * m.precision))
+
+    async def async_correct_remembered_power(self) -> None:
+        """Cancel the pending timer, then flip only remembered power. May beep."""
+        if self._power_policy is None:
+            raise ValueError("This climate profile has no power correction recipe")
+        await self._async_power_request("correct")
+
+    async def async_initialize_remembered_climate(
+        self, remembered_power: bool, last_hvac_mode: str, fan_mode: str, temperature: float,
+    ) -> None:
+        """Seed a newly adopted entity once, without IR, for a controlled migration.
+
+        This is copied controller memory, not a physical measurement. Refuse
+        after restoration or any send attempt; later correction must cancel.
+        """
+        async with self._power_request_lock:
+            if self._power_policy is None or self._power_has_history:
+                raise ValueError("Only a fresh power-policy entity can be initialized")
+            mode = self._file_mode_for(HVACMode(last_hvac_mode))
+            if mode is None or fan_mode not in self._matrix.fan_modes:
+                raise ValueError("Unsupported saved mode or fan")
+            if not isinstance(remembered_power, bool) or not math.isfinite(temperature):
+                raise ValueError("Invalid remembered power or saved temperature")
+            self._remembered_power = remembered_power
+            self._last_active_hvac_mode = HVACMode(last_hvac_mode)
+            self._hvac_mode = self._last_active_hvac_mode if remembered_power else HVACMode.OFF
+            self._fan_mode = self._power_policy.effective_fan(mode, fan_mode)
+            self._target_temperature = self._snap_power_temperature(temperature)
+            self._power_has_history = True
+            self.async_write_ha_state()
+
+    async def _async_power_request(self, action: str, value: Any = None) -> None:
+        """Select, send and commit atomically, using state after acquiring the queue.
+
+        No delayed HA power action and no retry. After a transport exception
+        power becomes unknown: the blaster might have transmitted before failing.
+        Saved settings remain intact and the next request uses a timer-only frame.
+        """
+        async with self._power_request_lock:
+            policy = self._power_policy
+            if policy is None:
+                raise ValueError("Power policy was removed while the request was queued")
+            mode = self._file_mode_for(self._last_active_hvac_mode)
+            fan, temp = self._fan_mode, self._target_temperature
+            requested = self._remembered_power
+            explicit = action in ("on", "off", "mode")
+            if action == "correct":
+                if requested is None:
+                    raise ValueError(
+                        "Cannot flip unknown remembered power; request ON or OFF first"
+                    )
+                requested = not requested
+            elif action == "off" or (action == "mode" and value == HVACMode.OFF):
+                requested = False
+            elif action == "on":
+                requested = True
+            elif action == "mode":
+                mode = self._file_mode_for(value)
+                if mode is None:
+                    raise ValueError(f"Unsupported HVAC mode: {value}")
+                requested = True
+            elif action == "fan":
+                if policy.fan_power_control and value == "off":
+                    requested, explicit = False, True
+                else:
+                    if value not in self._matrix.fan_modes:
+                        raise ValueError(f"Unsupported fan: {value}")
+                    fan = value
+                    if policy.fan_requests_on(value):
+                        requested, explicit = True, True
+            elif action == "temperature":
+                if value is None or mode not in policy.temperature_modes:
+                    return
+                target = float(value)
+                if not math.isfinite(target):
+                    raise ValueError("Target temperature must be finite")
+                temp = self._snap_power_temperature(target)
+            else:
+                raise ValueError(f"Unknown climate action: {action}")
+            # Correction preserves all settings, even if a saved fan is unusual
+            # for the last mode. Normal requests apply the profile's constraints.
+            if action != "correct":
+                fan = policy.effective_fan(mode, fan)
+            changed = (fan, temp, mode) != (
+                self._fan_mode, self._target_temperature,
+                self._file_mode_for(self._last_active_hvac_mode),
+            )
+            send = explicit or action == "correct" or (requested is True and changed)
+            if not send and not changed:
+                return
+            if send:
+                cell = resolve_cell(self._matrix, mode, fan, None, temp)
+                # Stateful dispatch refuses a sparse fallback to another fan.
+                if cell is None or cell.mode != mode or cell.fan != fan:
+                    raise ValueError("No validated packet for these settings")
+                variant = "cancel" if action == "correct" else power_variant(
+                    self._remembered_power, requested,
+                )
+                code = cell.power_variants[variant]
+                self._power_has_history = True
+                try:
+                    await self._manager.async_send_matrix_cell(
+                        self._device.id, f"{variant}: {self._cell_display_name(cell)}", code,
+                        origin=ORIGIN_ENTITY, single_frame=True,
+                        minimum_interval=policy.min_send_interval,
+                    )
+                except (Exception, asyncio.CancelledError):
+                    self._remembered_power = None
+                    self.async_write_ha_state()
+                    raise
+                self._matrix_cell = variant
+            self._remembered_power = requested
+            self._last_active_hvac_mode = HVACMode(ha_mode_for(mode))
+            self._hvac_mode = self._last_active_hvac_mode if requested else HVACMode.OFF
+            self._fan_mode, self._target_temperature = fan, temp
+            self._preset_mode = None
+            self.async_write_ha_state()
     #
     # Shared shape: update the LOCAL state the user asked for, then
     # resolve the full target state to one cell and transmit it --
@@ -1364,6 +1606,9 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
         return modes[1] if len(modes) > 1 else HVACMode.AUTO
 
     async def async_set_hvac_mode(self, hvac_mode: HVACMode) -> None:
+        if self._power_policy is not None:
+            await self._async_power_request("mode", hvac_mode)
+            return
         self._preset_mode = None
         if self._matrix_mode:
             if hvac_mode == HVACMode.OFF:
@@ -1394,6 +1639,9 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
             self.async_write_ha_state()
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
+        if self._power_policy is not None:
+            await self._async_power_request("temperature", kwargs.get(ATTR_TEMPERATURE))
+            return
         raw_target = kwargs.get(ATTR_TEMPERATURE)
         if raw_target is None:
             return
@@ -1419,6 +1667,9 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
         self.async_write_ha_state()
 
     async def async_set_fan_mode(self, fan_mode: str) -> None:
+        if self._power_policy is not None:
+            await self._async_power_request("fan", fan_mode)
+            return
         self._preset_mode = None
         if self._matrix_mode:
             self._fan_mode = fan_mode
@@ -1432,6 +1683,8 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
             self.async_write_ha_state()
 
     async def async_set_swing_mode(self, swing_mode: str) -> None:
+        if self._power_policy is not None:
+            raise ValueError("Swing is not supported by this profile")
         # Matrix mode only: preset mode never advertises SWING_MODE, so
         # HA never routes here for it.
         if not self._matrix_mode:
@@ -1508,6 +1761,9 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
         self.async_write_ha_state()
 
     async def async_turn_on(self) -> None:
+        if self._power_policy is not None:
+            await self._async_power_request("on")
+            return
         self._preset_mode = None
         if self._matrix_mode:
             m = self._matrix
@@ -1537,6 +1793,9 @@ class HAIRClimateEntity(RestoreEntity, ClimateEntity):
         self.async_write_ha_state()
 
     async def async_turn_off(self) -> None:
+        if self._power_policy is not None:
+            await self._async_power_request("off")
+            return
         self._preset_mode = None
         if self._matrix_mode:
             await self._async_matrix_off()

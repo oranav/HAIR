@@ -1,8 +1,14 @@
-# The wig format (hair-wig/3, and /4 for extra lattices)
+# The wig format (hair-wig/3, /4 for extras, /5 for state-dependent power)
 
 A wig is a portable IR code set: one JSON file describing one remote. HAIR reads wigs from `/config/hair/wigs/`, and any tool can emit them. This page is the format contract; if you build something that writes wigs, this is everything you need.
 
 The current version is `hair-wig/3`, and it is what nearly every file declares: HAIR emits it for every wig, plain button sets and climate matrices alike, and new files -- including anything submitted to the WigShop -- must declare it or better. `hair-wig/4` adds exactly one thing, the climate block's `extras` key, and a file says `4` only when it carries one; a wig without extras is still a v3 file that every install already reads. Both supersede `hair-wig/1` and `hair-wig/2`; the short history of those majors, and how existing old files are handled, lives in the collapsed section near the bottom.
+
+This private fork additionally supports `hair-wig/5` for a climate matrix with
+an opt-in `power_policy` and per-cell `power_variants`. Ordinary /3 and /4 files
+and their hashes are unchanged. A policy file must declare /5 so older readers
+refuse it instead of ignoring its transition semantics. See State-dependent
+power below.
 
 ## A complete example
 
@@ -30,11 +36,61 @@ The current version is `hair-wig/3`, and it is what nearly every file declares: 
 }
 ```
 
+## State-dependent power (hair-wig/5, private POC)
+
+A matrix may opt in using `power_policy`:
+
+```json
+{
+    "default_mode": "cool",
+    "default_fan": "auto",
+    "temperature_modes": ["cool", "heat"],
+    "fan_overrides": {"dry": {"auto": "low", "low": "low", "medium": "low", "high": "low"},
+                      "fan_only": {"auto": "low"}},
+    "fan_power_control": true,
+    "min_send_interval": 3
+}
+```
+
+Defaults must name declared operating mode/fan values. `temperature_modes`
+identifies modes whose cells have a target dimension; other modes have no
+`temp` dimension and preserve the saved target. Fan overrides map declared
+mode/fan values. Optional `fan_power_control` defaults false: when true an
+operating fan selection explicitly requests ON, and an appended fan Off
+option requests OFF while preserving the saved speed. A nonempty list of
+operating fans instead selects which fan requests explicitly turn ON; other
+fan selections preserve remembered power (local while OFF/unknown, sending
+only changed settings while ON). For example `["low", "medium", "high"]`
+makes Fan Auto preserve power. Boolean policies retain their prior behavior.
+`min_send_interval`
+defaults to 3 seconds (finite, 0–60): the transmit gate enforces it after actual
+sends, including failed attempts, without delaying local/no-op writes.
+
+Every cell in such a matrix must have `send_count: 1` (or omit it) and a
+`power_variants` object containing exactly `on_only`, `on_toggle`, `off_only`,
+`off_toggle`, and `cancel`, each a complete raw Pronto recipe with a nonempty
+initial burst and an empty repeat section. `pronto` must equal `on_only`;
+`off` remains a required timer-only fallback for profile convention, although
+climate requests resolve a settings cell's own OFF variant. The generic code
+selects `*_toggle` only when remembered power is known and differs from the
+request. Unknown or matching power selects `*_only`. Protocol timer encoding
+and payload semantics are entirely the profile author's responsibility.
+Swing and extras are outside this POC's opt-in policy interface.
+
+The policy and all variant codes participate in `canonical_cells_json` only
+when a policy exists; changing them changes `cells_hash`. /3 or /4 files
+carrying these fields are refused. An adopted policy matrix stores as
+`hair-matrix/2`, while ordinary matrices remain /1. Loading, adopting,
+initializing and restoring do not transmit. Use the native climate interface
+and `hair.correct_remembered_power`, not raw matrix-card/pin/preset sends,
+which bypass transition selection. See the private
+[AC POC](../poc/ac_hybrid/README.md) for behavior, evidence and migration.
+
 ## Rules
 
 **Required fields:** `format`, `name`, and a non-empty `signals` list. Each signal requires `alias` and `pronto`. Everything else is optional. One exception: a wig with a `climate` block may have an empty or absent `signals` list -- matrix-only wigs are legal, because the matrix is the payload and flat signals are the optional extras riding alongside it.
 
-**`format`** must be `"hair-wig/3"` for any file written today, or `"hair-wig/4"` for the one case that needs it: a climate block carrying `extras` (see Extra lattices below). The version follows the content, exactly as v2 did for the climate block itself, so a wig that does not use the key pays nothing for its existence. The major version gates parsing: a reader that sees a higher major version than it knows refuses the file and asks the user to update, rather than guessing. Readers below 3 refuse a v3 file with a version message, and that refusal is the point: without it an older reader would compute the previous canonical form, see a mismatch, and report what looks like tampering on a perfectly good file, which is the worst possible thing to tell someone about a file they trust. A reader that knows up to 3 refuses a v4 file for the same reason: it would otherwise hash a matrix without the codes in `extras` and call a good file tampered. The rule runs both ways, so a file stamped `/3` that carries `extras` is refused too (see Extra lattices below). (For what v3 changed and how the superseded majors are handled, see the collapsed section near the bottom.)
+**`format`** must be `"hair-wig/5"` for state-dependent power (above), otherwise `"hair-wig/3"` for files written today, or `"hair-wig/4"` for the one case that needs it: a climate block carrying `extras` (see Extra lattices below). The version follows the content, exactly as v2 did for the climate block itself, so a wig that does not use the key pays nothing for its existence. The major version gates parsing: a reader that sees a higher major version than it knows refuses the file and asks the user to update, rather than guessing. Readers below 3 refuse a v3 file with a version message, and that refusal is the point: without it an older reader would compute the previous canonical form, see a mismatch, and report what looks like tampering on a perfectly good file, which is the worst possible thing to tell someone about a file they trust. A reader that knows up to 3 refuses a v4 file for the same reason: it would otherwise hash a matrix without the codes in `extras` and call a good file tampered. The rule runs both ways, so a file stamped `/3` that carries `extras` is refused too (see Extra lattices below). (For what v3 changed and how the superseded majors are handled, see the collapsed section near the bottom.)
 
 **`pronto`** carries the raw Pronto hex code, and it is the entire payload. Deliberately, there are no decoded-protocol fields in the file: the importing HAIR install decodes every signal fresh through its own decoders, so a wig can never carry a stale or wrong identity, and it benefits from decoders that shipped after the wig was written. Codes must be valid learned-format Pronto (`0000` header, correct burst-pair length math); HAIR validates each one and rejects the file with a per-signal reason if any code is malformed. Stored codes end in a zero trailing gap by design, which keeps signal identity byte-stable; a copy ready to transmit or to paste into another tool comes from the HAIR panel, which serves every code it shows with a real terminator.
 

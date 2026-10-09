@@ -521,6 +521,7 @@ _stub("homeassistant.helpers.area_registry", {
 
 _stub("homeassistant.helpers.entity_platform", {
     "AddEntitiesCallback": MagicMock,
+    "async_get_current_platform": MagicMock,
 })
 
 # State-machine domain trackers (receiver hot-plug, v0.5.8). The stubs

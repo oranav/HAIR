@@ -54,6 +54,7 @@ MATRIX_SUFFIX = ".matrix.json"
 MATRIX_FORMAT_NAME = "hair-matrix"
 MATRIX_FORMAT_MAJOR = 1
 MATRIX_FORMAT_V1 = f"{MATRIX_FORMAT_NAME}/{MATRIX_FORMAT_MAJOR}"
+MATRIX_FORMAT_V2 = f"{MATRIX_FORMAT_NAME}/2"
 
 
 def matrices_dir(config_dir: str | Path) -> Path:
@@ -144,7 +145,8 @@ def write_matrix(
         raise ValueError(f"Unsafe device id for matrix file: {device_id!r}")
     ensure_matrices_dir(config_dir)
     text = json.dumps(
-        {"format": MATRIX_FORMAT_V1, "climate": _climate_out(matrix)},
+        {"format": MATRIX_FORMAT_V2 if matrix.power_policy else MATRIX_FORMAT_V1,
+         "climate": _climate_out(matrix)},
         separators=(",", ":"),
         ensure_ascii=False,
     )
@@ -180,7 +182,7 @@ def load_matrix(
         _LOGGER.warning("Matrix file %s: top level is not an object", path)
         return None
     fmt = data.get("format")
-    if fmt != MATRIX_FORMAT_V1:
+    if fmt not in (MATRIX_FORMAT_V1, MATRIX_FORMAT_V2):
         # Same posture as the wig gate: a future major refuses politely
         # instead of guessing at a schema this install does not know.
         _LOGGER.warning(
@@ -189,7 +191,7 @@ def load_matrix(
         )
         return None
     errors: list[str] = []
-    matrix = _parse_climate(data.get("climate"), errors)
+    matrix = _parse_climate(data.get("climate"), errors, major=5 if fmt == MATRIX_FORMAT_V2 else 4)
     if errors or matrix is None:
         _LOGGER.warning(
             "Matrix file %s failed validation: %s", path, "; ".join(errors)

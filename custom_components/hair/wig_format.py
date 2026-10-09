@@ -38,6 +38,12 @@ import re
 import uuid
 from dataclasses import dataclass, field
 
+from .climate_power import (
+    POWER_VARIANTS,
+    MatrixPowerPolicy,
+    parse_power_policy,
+    single_frame_pronto,
+)
 from .const import (
     MAX_DITTO_COUNT,
     MAX_SEND_COUNT,
@@ -88,10 +94,13 @@ WIG_FORMAT_MAJOR_RECIPE = 3
 # still a /3 file that every install reads, and only a wig that carries
 # one demands the version it needs.
 WIG_FORMAT_MAJOR_EXTRAS = 4
+# State-dependent power recipes must be refused by older readers.
+WIG_FORMAT_MAJOR_POWER = 5
 WIG_FORMAT_V1 = f"{WIG_FORMAT_NAME}/{WIG_FORMAT_MAJOR}"
 WIG_FORMAT_V2 = f"{WIG_FORMAT_NAME}/{WIG_FORMAT_MAJOR_CLIMATE}"
 WIG_FORMAT_V3 = f"{WIG_FORMAT_NAME}/{WIG_FORMAT_MAJOR_RECIPE}"
 WIG_FORMAT_V4 = f"{WIG_FORMAT_NAME}/{WIG_FORMAT_MAJOR_EXTRAS}"
+WIG_FORMAT_V5 = f"{WIG_FORMAT_NAME}/{WIG_FORMAT_MAJOR_POWER}"
 
 WIG_SUFFIX = ".wig.json"
 
@@ -124,9 +133,9 @@ _KNOWN_TOP = {
 
 _KNOWN_CLIMATE = {
     "min_temp", "max_temp", "precision", "unit", "modes", "fan_modes",
-    "swing_modes", "off", "on", "cells", "extras",
+    "swing_modes", "off", "on", "cells", "extras", "power_policy",
 }
-_KNOWN_CELL = {"mode", "fan", "swing", "temp", "pronto", "send_count"}
+_KNOWN_CELL = {"mode", "fan", "swing", "temp", "pronto", "send_count", "power_variants"}
 
 @dataclass(frozen=True)
 class KindEntry:
@@ -400,6 +409,7 @@ class ClimateCell:
     temp: float | None = None
     send_count: int = 1
     extra: dict = field(default_factory=dict)
+    power_variants: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
@@ -443,6 +453,7 @@ class ClimateMatrix:
     # exactly as it did before the key existed.
     extras: list[ClimateExtra] = field(default_factory=list)
     extra: dict = field(default_factory=dict)
+    power_policy: MatrixPowerPolicy | None = None
 
 
 def cell_key(cell: ClimateCell) -> str:
@@ -596,7 +607,7 @@ def parse_wig(text: str) -> WigParseResult:
         return WigParseResult(None, [
             f'"format" is {fmt!r}, expected "hair-wig/1"'
         ])
-    if int(match.group(1)) > WIG_FORMAT_MAJOR_EXTRAS:
+    if int(match.group(1)) > WIG_FORMAT_MAJOR_POWER:
         return WigParseResult(None, [
             f"this wig uses {fmt}, which this version of HAIR does not "
             "read yet; update HAIR to import it"
@@ -894,6 +905,12 @@ def _parse_cells(
                 f"{path}[{i}].send_count: must be an integer when present"
             )
             send_count = 1
+        variants = raw_cell.get("power_variants", {})
+        if "power_variants" in raw_cell and (
+            not isinstance(variants, dict) or set(variants) != POWER_VARIANTS
+            or not all(single_frame_pronto(code) for code in variants.values())
+        ):
+            errors.append(f"{path}[{i}].power_variants: requires five single-frame Pronto codes")
         if len(errors) > cell_errors_before:
             continue
         cells.append(ClimateCell(
@@ -903,13 +920,14 @@ def _parse_cells(
             temp=_num(temp) if temp is not None else None,
             pronto=pronto.strip(),
             send_count=max(1, min(send_count, MAX_SEND_COUNT)),
+            power_variants=dict(variants),
             extra={k: v for k, v in raw_cell.items() if k not in _KNOWN_CELL},
         ))
     return cells
 
 
 def _parse_climate(
-    raw: object, errors: list[str], major: int = WIG_FORMAT_MAJOR_EXTRAS
+    raw: object, errors: list[str], major: int = WIG_FORMAT_MAJOR_POWER
 ) -> ClimateMatrix | None:
     """Validate the climate block strictly-with-reasons.
 
@@ -974,6 +992,34 @@ def _parse_climate(
         on = None
 
     cells = _parse_cells(raw.get("cells"), "climate.cells", errors)
+
+    power_policy = None
+    if "power_policy" in raw:
+        if major < WIG_FORMAT_MAJOR_POWER:
+            errors.append(f"climate.power_policy requires {WIG_FORMAT_V5}")
+        power_policy = parse_power_policy(
+            raw["power_policy"], lists["modes"], lists["fan_modes"], errors,
+        )
+        if lists["swing_modes"] or raw.get("extras"):
+            errors.append("climate.power_policy: swing and extras are not supported")
+        for i, cell in enumerate(cells):
+            if not cell.power_variants or cell.send_count != 1:
+                errors.append(
+                    f"climate.cells[{i}]: power policy requires variants and send_count 1"
+                )
+            elif cell.pronto != cell.power_variants["on_only"]:
+                errors.append(f"climate.cells[{i}].pronto must be the on_only variant")
+            if (power_policy is not None
+                    and (cell.mode in power_policy.temperature_modes) != (cell.temp is not None)):
+                errors.append(
+                    f"climate.cells[{i}]: temperature dimension disagrees with policy"
+                )
+        if power_policy is not None:
+            coordinates = [(c.mode, c.fan, c.swing, c.temp) for c in cells]
+            if len(set(coordinates)) != len(coordinates):
+                errors.append("climate.cells: duplicate power-policy settings")
+    elif any(c.power_variants for c in cells):
+        errors.append("climate.power_policy is required with power_variants")
 
     # hair-wig/4 extras. Validated exactly as ``cells`` is, including
     # every Pronto, because these are transmit recipes and they sit
@@ -1041,6 +1087,7 @@ def _parse_climate(
         on=on,
         cells=cells,
         extras=extras,
+        power_policy=power_policy,
         extra={k: v for k, v in raw.items() if k not in _KNOWN_CLIMATE},
     )
 
@@ -1067,6 +1114,8 @@ def serialize_wig(wig: Wig) -> str:
     fmt = WIG_FORMAT_V3
     if wig.climate is not None and wig.climate.extras:
         fmt = WIG_FORMAT_V4
+    if wig.climate is not None and wig.climate.power_policy is not None:
+        fmt = WIG_FORMAT_V5
     # No wig reaches disk without an identity (v0.9.5). See
     # ensure_wig_id for why this is here and not at each constructor.
     ensure_wig_id(wig)
@@ -1138,6 +1187,8 @@ def _cell_out(cell: ClimateCell) -> dict:
     out["pronto"] = cell.pronto
     if cell.send_count != 1:
         out["send_count"] = cell.send_count
+    if cell.power_variants:
+        out["power_variants"] = dict(cell.power_variants)
     out.update(cell.extra)
     return out
 
@@ -1169,6 +1220,8 @@ def _climate_out(matrix: ClimateMatrix) -> dict:
             }
             for extra in matrix.extras
         ]
+    if matrix.power_policy is not None:
+        out["power_policy"] = matrix.power_policy.as_dict()
     out.update(matrix.extra)
     return out
 
@@ -1299,6 +1352,10 @@ def canonical_cells_json(matrix: ClimateMatrix) -> str:
             {"axis": e.axis, "key": e.key, "cells": _cells(e.cells)}
             for e in matrix.extras
         ]
+    if matrix.power_policy is not None:
+        canon["power_policy"] = matrix.power_policy.as_dict()
+        for item, cell in zip(canon["cells"], matrix.cells, strict=True):
+            item["power_variants"] = {k: _pronto(v) for k, v in cell.power_variants.items()}
     return json.dumps(
         canon, sort_keys=True, separators=(",", ":"), ensure_ascii=False
     )

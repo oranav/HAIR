@@ -938,6 +938,7 @@ class DeviceManager:
         heard_future: Any | None = None,
         pinned: bool = False,
         sent: Any | None = None,
+        minimum_interval: float = 0.0,
     ) -> set[str]:
         """The shared all-emitters transmit path (GH #65 semantics).
 
@@ -1140,7 +1141,8 @@ class DeviceManager:
                     try:
                         await asyncio.wait_for(
                             gated_send(
-                                self._hass, emitter_id, wire_cmd, ir_send
+                                self._hass, emitter_id, wire_cmd, ir_send,
+                                minimum_interval=minimum_interval,
                             ),
                             timeout=ASSIGN_SERVICE_TIMEOUT_S,
                         )
@@ -1241,6 +1243,9 @@ class DeviceManager:
         cell: dict[str, Any] | None = None,
         power: str | None = None,
         origin: str | None = None,
+        *,
+        single_frame: bool = False,
+        minimum_interval: float = 0.0,
     ) -> None:
         """Send one climate matrix cell's raw Pronto (Cold Cuts).
 
@@ -1279,6 +1284,18 @@ class DeviceManager:
         from .ir_command import build_command
         from .send_signal import ORIGIN_MANAGER, DeviceSent
 
+        if single_frame:
+            from .climate_power import single_frame_pronto
+
+            if len(device.emitter_entity_ids) != 1 or send_count != 1:
+                raise ValueError(
+                    "State-dependent power requires exactly one emitter and one frame"
+                )
+            if not single_frame_pronto(pronto):
+                raise ValueError("State-dependent power requires a single-frame Pronto recipe")
+        matrix = self._matrix_cache.get(device_id)
+        if matrix is not None and matrix.power_policy is not None and not single_frame:
+            raise ValueError("Use native climate services for state-dependent power profiles")
         ir_cmd = build_command(protocol="PRONTO", code=pronto)
         await self._async_broadcast(
             device, ir_cmd, cell_name,
@@ -1287,6 +1304,7 @@ class DeviceManager:
             # (design R4): the lattice is thousands of cells with one
             # shared cadence, and nowhere to put a per-cell number.
             send_spacing_ms=None,
+            minimum_interval=minimum_interval,
             heard_future=heard_future,
             # Signpost 4, Track 4: a heard state driving a pinned
             # matrix Device rides here, and the Mirror row has to read
